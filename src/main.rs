@@ -10,6 +10,7 @@ use minio::s3::{
     http::BaseUrl,
 };
 use sysinfo::Disks;
+use tokio::sync::mpsc::{channel, Sender};
 use windows::{
     core::*,
     Win32::{
@@ -26,7 +27,7 @@ use windows::{
     },
 };
 use std::ffi::c_void;
-use std::sync::{mpsc,Arc};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 const _STYLE: &str = manganis::mg!(file("assets/tailwind.css"));
 const MAX_INTERVAL: Duration = Duration::minutes(30);
@@ -34,7 +35,7 @@ const CLASS_NAME: PCWSTR = w!("USB_EVENT_WINDOW");
 static ARRIVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 // static REMOVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-async fn monitor_usb_changes(tx:mpsc::Sender<u32>) -> Result<()> {
+async fn monitor_usb_changes(tx:Sender<u32>) -> Result<()> {
     // let tx_ptr: Box<_> = Box::new(Arc::new(tx));
     let tx_arc = Arc::new(tx);
     tokio::task::spawn_blocking(move || unsafe {
@@ -108,12 +109,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if count % 2 == 1 {
                     println!("USB device arrived1!");
                     // let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Arc<mpsc::Sender<u32>>;
-                    let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Arc<mpsc::Sender<u32>>;
+                    let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Arc<Sender<u32>>;
                     println!("USB device arrived2!");
                     // let tx = Box::from_raw(tx_ptr);
                     let tx = &*tx_ptr;
                     println!("USB device arrived3!");
-                    tx.send(wparam.0 as u32).unwrap();
+                    tx.blocking_send(wparam.0 as u32).unwrap();
                     println!("USB device arrived4!");
                 }
             },
@@ -321,27 +322,46 @@ fn ImageGroup(group: Groups, index: usize, select_group: EventHandler<bool>) -> 
                         }
                     }
                 }
-                div {
-                    div {
-                        class:"m-2 grid gap-3 grid-cols-8",
-                        for (index,(filename, _timestamp)) in group.images.iter().enumerate() {
-                            if index < 7 { 
-                                img {
-                                    src: format!("./{}", filename),
-                                    width: "170px",class:"m-2 rounded",
+                div{
+                    if group.images.len() < 15{
+                        div{
+                            class:"m-2 grid gap-3 grid-cols-8",
+                            for (index,(filename, _timestamp)) in group.images.iter().enumerate() {
+                                if index < 7 { 
+                                    img {
+                                        src: format!("./{}", filename),
+                                        width: "170px",class:"m-2 rounded",
+                                    }
                                 }
+                                
                             }
                         }
-                        "......"
                     }
-                    div {
-                        class:"m-2 grid gap-3 grid-cols-8",
-                        "......"
-                        for (index,(filename, _timestamp)) in group.images.iter().enumerate() {
-                            if  index >= group.images.len()-7{
-                                img {
-                                    src: format!("./{}", filename),
-                                    width: "170px",class:"m-2 rounded",
+                    else {
+                        div {
+                            class:"m-2 grid gap-3 grid-cols-8",
+                            for (index,(filename, _timestamp)) in group.images.iter().enumerate() {
+                                if index < 7 { 
+                                    img {
+                                        src: format!("./{}", filename),
+                                        width: "170px",
+                                        class:"m-2 rounded",
+                                    }
+                                }
+                                
+                            }
+                            "......"
+                        }
+                        div {
+                            class:"m-2 grid gap-3 grid-cols-8",
+                            "......"
+                            for (index,(filename, _timestamp)) in group.images.iter().enumerate() {
+                                if  index >= group.images.len()-7{
+                                    img {
+                                        src: format!("./{}", filename),
+                                        width: "170px",
+                                        class:"m-2 rounded",
+                                    }
                                 }
                             }
                         }
@@ -417,8 +437,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
 fn App() -> Element {
     let mut manager = use_signal(|| ImageManager::new());
     use_effect(move ||{
-        let (tx, rx) = mpsc::channel();
-        // let (s, r) = unbounded::<u32>();
+        let (tx, mut rx) = channel(32);
         spawn(async move {
             print!("1");
             if let Err(e) = monitor_usb_changes(tx).await {
@@ -427,7 +446,7 @@ fn App() -> Element {
         });
         spawn(async move {
             println!("USB device arrivedw!");
-            while let Ok(_) = rx.recv(){ 
+            while let Some(_) = rx.recv().await { 
                 println!("USB device arrivedwwwwww!");
                 manager.write().update_on_usb_arrival().await; 
                 println!("USB device arrivedwww!");
@@ -443,6 +462,6 @@ fn App() -> Element {
 fn main() {
     let config = dioxus::desktop::Config::new()
         .with_custom_head(format!(r#"<link rel="stylesheet" href="dist/{}">"#, _STYLE).to_string())
-        .with_window(WindowBuilder::new().with_maximized(true));
+        .with_window(WindowBuilder::new().with_maximized(true).with_title("usb"));
     LaunchBuilder::desktop().with_cfg(config).launch(App);
 }
