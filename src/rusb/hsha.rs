@@ -1,4 +1,7 @@
-use chrono::{prelude::{DateTime, Local},Duration,};
+use chrono::{
+    prelude::{DateTime, Local},
+    Duration,
+};
 use dioxus::prelude::*;
 use dioxus_desktop::WindowBuilder;
 use futures::executor::block_on;
@@ -21,22 +24,18 @@ use windows::{
             RegisterDeviceNotificationW, UnregisterDeviceNotification, DBT_DEVICEARRIVAL,
             DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE, DEVICE_NOTIFY_WINDOW_HANDLE,
             DEV_BROADCAST_DEVICEINTERFACE_W, WINDOW_EX_STYLE, WM_DEVICECHANGE, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW,SetWindowLongPtrW, GetWindowLongPtrW, GWLP_USERDATA,
+            WS_OVERLAPPEDWINDOW,SetWindowLongPtrW, GetWindowLongPtrW, GWLP_USERDATA
         },
     },
 };
-use std::ffi::c_void;
-use std::sync::{mpsc,Arc};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{ffi::c_void, ptr::null, sync::mpsc::Receiver};
+use std::sync::mpsc::{channel, Sender};
 const _STYLE: &str = manganis::mg!(file("assets/tailwind.css"));
 const MAX_INTERVAL: Duration = Duration::minutes(30);
 const CLASS_NAME: PCWSTR = w!("USB_EVENT_WINDOW");
-static ARRIVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-// static REMOVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-async fn monitor_usb_changes(tx:mpsc::Sender<u32>) -> Result<()> {
-    // let tx_ptr: Box<_> = Box::new(Arc::new(tx));
-    let tx_arc = Arc::new(tx);
+async fn monitor_usb_changes(tx:Sender<u32>) -> Result<()> {
+    let tx_ptr: Box<_> = Box::new(tx);
     tokio::task::spawn_blocking(move || unsafe {
         // 注册窗口类 
         let wc = WNDCLASSW {
@@ -63,9 +62,7 @@ async fn monitor_usb_changes(tx:mpsc::Sender<u32>) -> Result<()> {
             None,
         )
         .unwrap();
-        // SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(tx_ptr) as isize);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&tx_arc as *const _) as isize);
-
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(tx_ptr) as isize);
         // 创建设备通知
         let dbdi = DEV_BROADCAST_DEVICEINTERFACE_W {
             dbcc_size: std::mem::size_of::<DEV_BROADCAST_DEVICEINTERFACE_W>() as u32,
@@ -89,9 +86,6 @@ async fn monitor_usb_changes(tx:mpsc::Sender<u32>) -> Result<()> {
 
         // 清理资源
         UnregisterDeviceNotification(h_notification).unwrap();
-
-        // 清除 GWLP_USERDATA 中的数据
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     })
     .await
     .unwrap();
@@ -103,48 +97,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if msg == WM_DEVICECHANGE {
         match wparam.0 as u32 {
             DBT_DEVICEARRIVAL => {
-                let count = ARRIVAL_COUNT.fetch_add(1, Ordering::Relaxed);
-                println!("{count}");
-                if count % 2 == 1 {
-                    println!("USB device arrived1!");
-                    // let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Arc<mpsc::Sender<u32>>;
-                    let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Arc<mpsc::Sender<u32>>;
-                    println!("USB device arrived2!");
-                    // let tx = Box::from_raw(tx_ptr);
-                    let tx = &*tx_ptr;
-                    println!("USB device arrived3!");
-                    tx.send(wparam.0 as u32).unwrap();
-                    println!("USB device arrived4!");
-                }
+                println!("USB device arrived!");
+                let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Sender<u32>;
+                // 将指针转换回 Box<Sender>
+                let tx = Box::from_raw(tx_ptr);
+                tx.send(wparam.0 as u32).unwrap();
             },
             DBT_DEVICEREMOVECOMPLETE => {
                 println!("USB device removed!");
-                
+                let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Sender<u32>;
+                // 将指针转换回 Box<Sender>
+                let tx = Box::from_raw(tx_ptr);
+                tx.send(wparam.0 as u32).unwrap();
             },
             _ => {}
         }
     }
+
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
-
-#[derive(Clone, Debug , PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Groups {
     images: Vec<(String, DateTime<Local>)>,
     selected: bool,
 }
-
 #[derive(Clone)]
-pub struct ImageManager {  
+pub struct ImageManager {
     pub groups: Vec<Groups>,
+    pub station_name: String,
+    pub camera_name: String,
 }
-
 impl ImageManager {
-    pub fn new() -> Self {
-        let images = get_images_from_usb(); 
-        let groups = block_on(group_images_upon_time(images)); 
+    pub fn new(station_name: String, camera_name: String) -> Self {
+        let images = get_images_from_usb(); //遍历地址获取所有图片
+        let groups = block_on(group_images_upon_time(images)); //将图片按时间分组
 
         Self {
             groups,
+            station_name,
+            camera_name,
         }
     }
 
@@ -155,14 +146,29 @@ impl ImageManager {
         }
     }
 
-    pub async fn update_on_usb_arrival(&mut self) {
-        let images = get_images_from_usb(); 
-        let groups = block_on(group_images_upon_time(images)); 
-        self.groups = groups;
+    fn set_station_name(&mut self, station_name: String) {
+        self.station_name = station_name;
     }
 
-    pub async fn select_imagegroups_upload(&self,station_name: &Signal<String>,canvas_name: &Signal<String>) {
-        let selected_image_paths: Vec<String> = self
+    fn set_camera_name(&mut self, camera_name: String) {
+        self.camera_name = camera_name;
+    }
+
+    pub fn update_on_usb_arrival(&mut self) {
+        self.groups.clear();
+        let images = get_images_from_usb(); // 遍历地址获取所有图片
+        let groups = block_on(group_images_upon_time(images)); // 将图片按时间分组【
+        self.groups = groups;
+        // Self{
+        //     groups,
+        //     station_name:self.camera_name.clone(),
+        //     camera_name:self.camera_name.clone(),
+        // }
+    }
+
+    // 将勾选的图片上传
+    pub fn upload_selected(&self) {
+        let select_image_paths: Vec<String> = self
             .groups
             .iter()
             .filter(|group| group.selected)
@@ -173,19 +179,19 @@ impl ImageManager {
                     .map(|(path, _)| path.replace("\\", "/").clone())
             })
             .collect();
-        for images_path in selected_image_paths.iter() {
+
+        for images_path in select_image_paths.into_iter() {
             let file_name = images_path.split('/').last().unwrap_or(&"").to_string();
             let future = async move {
-                let station_clone = station_name.to_string();
-                let canvas_clone = canvas_name.to_string();
-                upload_folder_to_minio(&images_path, &file_name, &station_clone, &canvas_clone)
+                let station_name = self.station_name.clone();
+                let camera_name = self.camera_name.clone();
+                upload_folder_to_minio(&images_path, &file_name, &station_name, &camera_name)
                     .await
                     .unwrap();
             };
             let _ = block_on(future);
         }
     }
-
 }
 
 // 1.获取移动硬盘USb的地址
@@ -234,7 +240,7 @@ async fn group_images_upon_time(mut images: Vec<(String, DateTime<Local>)>) -> V
         .chain(std::iter::once(images.len()))
         .scan(0, |start, end| {
             let group = &images[*start..end];
-            *start = end; 
+            *start = end;
             Some(group)
         })
         .map(|group| Groups {
@@ -245,6 +251,7 @@ async fn group_images_upon_time(mut images: Vec<(String, DateTime<Local>)>) -> V
     new_groups
 }
 
+//上传
 async fn upload_folder_to_minio(local_upload_path: &str,object_name: &str,station_name: &str,camera_name: &str,) -> core::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = "http://10.230.30.210".parse::<BaseUrl>()?;
     let static_provider = StaticProvider::new(
@@ -353,10 +360,9 @@ fn ImageGroup(group: Groups, index: usize, select_group: EventHandler<bool>) -> 
 }
 
 
+
 #[component]
 fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
-    let mut station_name = use_signal(String::new);
-    let mut canvas_name = use_signal(String::new);
     rsx! {
         div {
             class: "m-2 border border-gray-300",
@@ -370,7 +376,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
                     input{
                         class:"input-text",r#type: "text",
                         oninput:  move  |e| {
-                            station_name.set(e.value());
+                            manager.write().set_station_name(e.value());
                         },
                     }
                 }
@@ -382,7 +388,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
                     input{
                         class:"input-text",r#type: "text",
                         oninput:  move  |e| {
-                            canvas_name.set(e.value());
+                            manager.write().set_camera_name(e.value());
                         },
                     }
                 }
@@ -390,10 +396,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
                     button{
                         class:"btn-blue ml-2 centre",
                         onclick:  move  |_| {
-                            async move{
-                                manager.read().select_imagegroups_upload(&station_name, &canvas_name).await;
-                            }
-                           
+                            manager.read().upload_selected();
                         },
                         "上传",
                     }
@@ -412,32 +415,46 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
         }
     }
 }
-// static MANAGER:GlobalSignal<ImageManager> = Signal::global(||ImageManager::new());
+
 #[component]
 fn App() -> Element {
-    let mut manager = use_signal(|| ImageManager::new());
+    let (tx, rx) = channel();
+    let mut  manager = use_signal(|| ImageManager::new(String::from("StationName"), String::from("CameraName")));
     use_effect(move ||{
-        let (tx, rx) = mpsc::channel();
-        // let (s, r) = unbounded::<u32>();
+        let tx =tx.clone();
         spawn(async move {
-            print!("1");
             if let Err(e) = monitor_usb_changes(tx).await {
-                eprintln!("Error in monitor_usb_changes: {}", e);
-            }
-        });
-        spawn(async move {
-            println!("USB device arrivedw!");
-            while let Ok(_) = rx.recv(){ 
-                println!("USB device arrivedwwwwww!");
-                manager.write().update_on_usb_arrival().await; 
-                println!("USB device arrivedwww!");
+                eprintln!("Error in usb_dirs: {}", e);
             }
         });
     });
 
+    // spawn(async move {
+    //     if let Err(e) = monitor_usb_changes(tx).await {
+    //         eprintln!("Error in usb_dirs: {}", e);
+    //     }
+    // });
+    // spawn(async move {
+    //     while let Ok(_) = rx.recv(){
+    //         println!("USB device arrivedwwwwww!");
+    //         manager.write().update_on_usb_arrival();
+    //         println!("USB device arrivedwww!");
+    //     }
+    // });
+
+    use_effect(move ||{
+        while let Ok(_) = rx.recv(){
+            println!("USB device arrivedwwwwww!");
+            manager.write().update_on_usb_arrival();
+            println!("USB device arrivedwww!");
+        }
+    });
     rsx!{
-        ImageGroupList{ manager : manager}
+        ImageGroupList{
+            manager : manager
+        }
     }
+
 }
 
 fn main() {
@@ -445,4 +462,5 @@ fn main() {
         .with_custom_head(format!(r#"<link rel="stylesheet" href="dist/{}">"#, _STYLE).to_string())
         .with_window(WindowBuilder::new().with_maximized(true));
     LaunchBuilder::desktop().with_cfg(config).launch(App);
+  
 }
