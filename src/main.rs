@@ -26,7 +26,7 @@ use windows::{
         },
     },
 };
-use percent_encoding::{AsciiSet,CONTROLS,utf8_percent_encode};
+use urlencoding::encode;
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -238,8 +238,6 @@ async fn group_images_upon_time(mut images: Vec<(String, DateTime<Local>)>) -> V
     new_groups
 }
 
-const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`').add(b'(').add(b')').add(b'+').add(b'-');
-
 // 上传图片进MinIO
 async fn upload_folder_to_minio(local_upload_path: &str,object_name: &str,station_name: &str,camera_name: &str,) -> core::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = "http://10.230.30.210".parse::<BaseUrl>()?;
@@ -267,10 +265,9 @@ async fn upload_folder_to_minio(local_upload_path: &str,object_name: &str,statio
             .unwrap();
     }
 
-    // 对含有中文的对象键进行 URL 编码
-    let encoded_object_name = utf8_percent_encode(object_name, FRAGMENT).to_string();
-    let encoded_camera_name = utf8_percent_encode(camera_name, FRAGMENT).to_string();
-    let upload_name = format!("{}/{}", encoded_camera_name, encoded_object_name);
+     let encoded_object_name = encode(object_name).to_string();
+     let encoded_camera_name = encode(camera_name).to_string();
+     let upload_name = format!("{}/{}", encoded_camera_name, encoded_object_name);
 
     client
         .upload_object(
