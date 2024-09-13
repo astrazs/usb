@@ -26,6 +26,7 @@ use windows::{
         },
     },
 };
+use percent_encoding::{AsciiSet,CONTROLS,utf8_percent_encode};
 use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,10 +34,8 @@ const _STYLE: &str = manganis::mg!(file("assets/tailwind.css"));
 const MAX_INTERVAL: Duration = Duration::minutes(30);
 const CLASS_NAME: PCWSTR = w!("USB_EVENT_WINDOW");
 static ARRIVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
-// static REMOVAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 async fn monitor_usb_changes(tx:Sender<u32>) -> Result<()> {
-    // let tx_ptr: Box<_> = Box::new(Arc::new(tx));
     let tx_arc = Arc::new(tx);
     tokio::task::spawn_blocking(move || unsafe {
         // 注册窗口类 
@@ -64,7 +63,7 @@ async fn monitor_usb_changes(tx:Sender<u32>) -> Result<()> {
             None,
         )
         .unwrap();
-        // SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(tx_ptr) as isize);
+
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&tx_arc as *const _) as isize);
 
         // 创建设备通知
@@ -107,13 +106,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let count = ARRIVAL_COUNT.fetch_add(1, Ordering::Relaxed);
                 println!("{count}");
                 if count % 2 == 1 {
-                    println!("USB device arrived1!");
-                    // let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Arc<mpsc::Sender<u32>>;
                     let tx_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Arc<Sender<u32>>;
-                    println!("USB device arrived2!");
-                    // let tx = Box::from_raw(tx_ptr);
                     let tx = &*tx_ptr;
-                    println!("USB device arrived3!");
                     tx.blocking_send(wparam.0 as u32).unwrap();
                     println!("USB device arrived4!");
                 }
@@ -143,7 +137,6 @@ impl ImageManager {
     pub fn new() -> Self {
         let images = get_images_from_usb(); 
         let groups = block_on(group_images_upon_time(images)); 
-
         Self {
             groups,
         }
@@ -162,7 +155,7 @@ impl ImageManager {
         self.groups = groups;
     }
 
-    pub async fn select_imagegroups_upload(&self,station_name: &Signal<String>,canvas_name: &Signal<String>) {
+    pub async fn select_imagegroups_upload(&self,station_name: &Signal<String>,camera_name: &Signal<String>) {
         let selected_image_paths: Vec<String> = self
             .groups
             .iter()
@@ -178,15 +171,14 @@ impl ImageManager {
             let file_name = images_path.split('/').last().unwrap_or(&"").to_string();
             let future = async move {
                 let station_clone = station_name.to_string();
-                let canvas_clone = canvas_name.to_string();
-                upload_folder_to_minio(&images_path, &file_name, &station_clone, &canvas_clone)
+                let camera_clone = camera_name.to_string();
+                upload_folder_to_minio(&images_path, &file_name, &station_clone, &camera_clone)
                     .await
                     .unwrap();
             };
             let _ = block_on(future);
         }
     }
-
 }
 
 // 1.获取移动硬盘USb的地址
@@ -246,6 +238,9 @@ async fn group_images_upon_time(mut images: Vec<(String, DateTime<Local>)>) -> V
     new_groups
 }
 
+const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`').add(b'(').add(b')').add(b'+').add(b'-');
+
+// 上传图片进MinIO
 async fn upload_folder_to_minio(local_upload_path: &str,object_name: &str,station_name: &str,camera_name: &str,) -> core::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_url = "http://10.230.30.210".parse::<BaseUrl>()?;
     let static_provider = StaticProvider::new(
@@ -271,7 +266,12 @@ async fn upload_folder_to_minio(local_upload_path: &str,object_name: &str,statio
             .await
             .unwrap();
     }
-    let upload_name = format!("{}/{}", camera_name, object_name);
+
+    // 对含有中文的对象键进行 URL 编码
+    let encoded_object_name = utf8_percent_encode(object_name, FRAGMENT).to_string();
+    let encoded_camera_name = utf8_percent_encode(camera_name, FRAGMENT).to_string();
+    let upload_name = format!("{}/{}", encoded_camera_name, encoded_object_name);
+
     client
         .upload_object(
             &mut UploadObjectArgs::new(&bucket_name, &upload_name, &local_upload_path).unwrap(),
@@ -282,6 +282,7 @@ async fn upload_folder_to_minio(local_upload_path: &str,object_name: &str,statio
     Ok(())
 }
 
+// 每组图片显示组件
 #[component]
 fn ImageGroup(group: Groups, index: usize, select_group: EventHandler<bool>) -> Element {
     let selected = group.selected;
@@ -372,11 +373,11 @@ fn ImageGroup(group: Groups, index: usize, select_group: EventHandler<bool>) -> 
     }
 }
 
-
+// 上传图片组件
 #[component]
 fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
     let mut station_name = use_signal(String::new);
-    let mut canvas_name = use_signal(String::new);
+    let mut camera_name = use_signal(||String::from("画布名称"));
     rsx! {
         div {
             class: "m-2 border border-gray-300",
@@ -402,7 +403,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
                     input{
                         class:"input-text",r#type: "text",
                         oninput:  move  |e| {
-                            canvas_name.set(e.value());
+                            camera_name.set(e.value());
                         },
                     }
                 }
@@ -411,7 +412,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
                         class:"btn-blue ml-2 centre",
                         onclick:  move  |_| {
                             async move{
-                                manager.read().select_imagegroups_upload(&station_name, &canvas_name).await;
+                                manager.read().select_imagegroups_upload(&station_name, &camera_name).await;
                             }
                            
                         },
@@ -432,7 +433,7 @@ fn ImageGroupList(manager: Signal<ImageManager>) -> Element {
         }
     }
 }
-// static MANAGER:GlobalSignal<ImageManager> = Signal::global(||ImageManager::new());
+
 #[component]
 fn App() -> Element {
     let mut manager = use_signal(|| ImageManager::new());
